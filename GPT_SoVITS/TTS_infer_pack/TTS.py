@@ -1054,6 +1054,10 @@ class TTS:
             "vits": 0.0,
             "post": 0.0,
         }
+        gpu_peak_reserved = 0.0
+        gpu_peak_allocated = 0.0
+        if "cuda" in str(self.configs.device) and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.configs.device)
 
         if parallel_infer:
             print(i18n("并行推理模式已开启"))
@@ -1337,13 +1341,28 @@ class TTS:
                         super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                     )
                     perf_stats["post"] += time.perf_counter() - pp_start
+                    if "cuda" in str(self.configs.device) and torch.cuda.is_available():
+                        curr_reserved = torch.cuda.memory_reserved(self.configs.device) / (1024 * 1024)
+                        curr_allocated = torch.cuda.memory_allocated(self.configs.device) / (1024 * 1024)
+                        curr_frag = (
+                            (curr_reserved - curr_allocated) / curr_reserved * 100
+                            if curr_reserved
+                            else 0.0
+                        )
+                        gpu_peak_reserved = max(gpu_peak_reserved, curr_reserved)
+                        gpu_peak_allocated = max(gpu_peak_allocated, curr_allocated)
+                    else:
+                        curr_reserved = curr_allocated = curr_frag = 0.0
                     perf_logger.info(
-                        "fragment\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tpost=%.3f",
+                        "fragment\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tpost=%.3f\tgpu_alloc=%.1fMB\tgpu_reserved=%.1fMB\tgpu_frag=%.1f%%",
                         perf_stats["prepare"],
                         perf_stats["text"],
                         perf_stats["t2s"],
                         perf_stats["vits"],
                         perf_stats["post"],
+                        curr_allocated,
+                        curr_reserved,
+                        curr_frag,
                     )
                     yield out
                 else:
@@ -1394,8 +1413,18 @@ class TTS:
         finally:
             run_total = time.perf_counter() - run_start
             mem_end = proc.memory_info().rss / (1024 * 1024)
+            if "cuda" in str(self.configs.device) and torch.cuda.is_available():
+                peak_reserved = torch.cuda.max_memory_reserved(self.configs.device) / (1024 * 1024)
+                peak_allocated = torch.cuda.max_memory_allocated(self.configs.device) / (1024 * 1024)
+                gpu_fragment = (
+                    (peak_reserved - peak_allocated) / peak_reserved * 100
+                    if peak_reserved
+                    else 0.0
+                )
+            else:
+                peak_reserved = peak_allocated = gpu_fragment = 0.0
             perf_logger.info(
-                "summary\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tpost=%.3f\ttotal=%.3f\tmem_start=%.1fMB\tmem_end=%.1fMB",
+                "summary\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tpost=%.3f\ttotal=%.3f\tmem_start=%.1fMB\tmem_end=%.1fMB\tgpu_peak_alloc=%.1fMB\tgpu_peak_reserved=%.1fMB\tgpu_frag=%.1f%%",
                 perf_stats["prepare"],
                 perf_stats["text"],
                 perf_stats["t2s"],
@@ -1404,6 +1433,9 @@ class TTS:
                 run_total,
                 mem_start,
                 mem_end,
+                peak_allocated,
+                peak_reserved,
+                gpu_fragment,
             )
             self.empty_cache()
 
