@@ -17,6 +17,7 @@ from typing import List, Tuple, Union
 
 import logging
 from time import perf_counter as _perf
+import psutil
 
 # 在模块最顶端（别放到类里）
 PERF_LOG_PATH = os.path.join(os.getcwd(), "logs", "tts_perf.log")
@@ -29,6 +30,8 @@ if not perf_logger.handlers:
     fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     fh.setFormatter(fmt)
     perf_logger.addHandler(fh)
+
+proc = psutil.Process(os.getpid())
 
 
 import ffmpeg
@@ -1042,6 +1045,24 @@ class TTS:
         sample_steps = inputs.get("sample_steps", 32)
         super_sampling = inputs.get("super_sampling", False)
 
+        run_start = time.perf_counter()
+        mem_start = proc.memory_info().rss / (1024 * 1024)
+        perf_stats = {
+            "prepare": 0.0,
+            "text": 0.0,
+            "t2s": 0.0,
+            "vits": 0.0,
+            "post": 0.0,
+            "vits_encp_prompt": 0.0,
+            "vits_encp_main": 0.0,
+            "vits_cfm": 0.0,
+            "vits_vocoder": 0.0,
+        }
+        gpu_peak_reserved = 0.0
+        gpu_peak_allocated = 0.0
+        if "cuda" in str(self.configs.device) and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.configs.device)
+
         if parallel_infer:
             print(i18n("并行推理模式已开启"))
             self.t2s_model.model.infer_panel = self.t2s_model.model.infer_panel_batch_infer
@@ -1125,6 +1146,7 @@ class TTS:
 
         ###### text preprocessing ########
         t1 = time.perf_counter()
+        perf_stats["prepare"] += t1 - t0
         data: list = None
         if not return_fragment:
             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
@@ -1180,6 +1202,7 @@ class TTS:
                 return batch[0]
 
         t2 = time.perf_counter()
+        perf_stats["text"] += t2 - t1
         try:
             print("############ 推理 ############")
             ###### inference ######
@@ -1227,6 +1250,7 @@ class TTS:
                 )
                 t4 = time.perf_counter()
                 t_34 += t4 - t3
+                perf_stats["t2s"] += t4 - t3
 
                 refer_audio_spec = []
                 if self.is_v2pro:sv_emb=[]
@@ -1291,7 +1315,12 @@ class TTS:
                     if parallel_infer:
                         print(f"{i18n('并行合成中')}...")
                         audio_fragments = self.using_vocoder_synthesis_batched_infer(
-                            idx_list, pred_semantic_list, batch_phones, speed=speed_factor, sample_steps=sample_steps
+                            idx_list,
+                            pred_semantic_list,
+                            batch_phones,
+                            speed=speed_factor,
+                            sample_steps=sample_steps,
+                            perf_dict=perf_stats,
                         )
                         batch_audio_fragment.extend(audio_fragments)
                     else:
@@ -1301,15 +1330,21 @@ class TTS:
                                 pred_semantic_list[i][-idx:].unsqueeze(0).unsqueeze(0)
                             )  # .unsqueeze(0)#mq要多unsqueeze一次
                             audio_fragment = self.using_vocoder_synthesis(
-                                _pred_semantic, phones, speed=speed_factor, sample_steps=sample_steps
+                                _pred_semantic,
+                                phones,
+                                speed=speed_factor,
+                                sample_steps=sample_steps,
+                                perf_dict=perf_stats,
                             )
                             batch_audio_fragment.append(audio_fragment)
 
                 t5 = time.perf_counter()
                 t_45 += t5 - t4
+                perf_stats["vits"] += t5 - t4
                 if return_fragment:
                     print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t4 - t3, t5 - t4))
-                    yield self.audio_postprocess(
+                    pp_start = time.perf_counter()
+                    out = self.audio_postprocess(
                         [batch_audio_fragment],
                         output_sr,
                         None,
@@ -1318,6 +1353,35 @@ class TTS:
                         fragment_interval,
                         super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                     )
+                    perf_stats["post"] += time.perf_counter() - pp_start
+                    if "cuda" in str(self.configs.device) and torch.cuda.is_available():
+                        curr_reserved = torch.cuda.memory_reserved(self.configs.device) / (1024 * 1024)
+                        curr_allocated = torch.cuda.memory_allocated(self.configs.device) / (1024 * 1024)
+                        curr_frag = (
+                            (curr_reserved - curr_allocated) / curr_reserved * 100
+                            if curr_reserved
+                            else 0.0
+                        )
+                        gpu_peak_reserved = max(gpu_peak_reserved, curr_reserved)
+                        gpu_peak_allocated = max(gpu_peak_allocated, curr_allocated)
+                    else:
+                        curr_reserved = curr_allocated = curr_frag = 0.0
+                    perf_logger.info(
+                        "fragment\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tencp_p=%.3f\tencp=%.3f\tcfm=%.3f\tvocoder=%.3f\tpost=%.3f\tgpu_alloc=%.1fMB\tgpu_reserved=%.1fMB\tgpu_frag=%.1f%%",
+                        perf_stats["prepare"],
+                        perf_stats["text"],
+                        perf_stats["t2s"],
+                        perf_stats["vits"],
+                        perf_stats["vits_encp_prompt"],
+                        perf_stats["vits_encp_main"],
+                        perf_stats["vits_cfm"],
+                        perf_stats["vits_vocoder"],
+                        perf_stats["post"],
+                        curr_allocated,
+                        curr_reserved,
+                        curr_frag,
+                    )
+                    yield out
                 else:
                     audio.append(batch_audio_fragment)
 
@@ -1330,7 +1394,8 @@ class TTS:
                 if len(audio) == 0:
                     yield 16000, np.zeros(int(16000), dtype=np.int16)
                     return
-                yield self.audio_postprocess(
+                pp_start = time.perf_counter()
+                out = self.audio_postprocess(
                     audio,
                     output_sr,
                     batch_index_list,
@@ -1339,6 +1404,20 @@ class TTS:
                     fragment_interval,
                     super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                 )
+                perf_stats["post"] += time.perf_counter() - pp_start
+                perf_logger.info(
+                    "run\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tencp_p=%.3f\tencp=%.3f\tcfm=%.3f\tvocoder=%.3f\tpost=%.3f",
+                    perf_stats["prepare"],
+                    perf_stats["text"],
+                    perf_stats["t2s"],
+                    perf_stats["vits"],
+                    perf_stats["vits_encp_prompt"],
+                    perf_stats["vits_encp_main"],
+                    perf_stats["vits_cfm"],
+                    perf_stats["vits_vocoder"],
+                    perf_stats["post"],
+                )
+                yield out
 
         except Exception as e:
             traceback.print_exc()
@@ -1353,6 +1432,36 @@ class TTS:
             self.init_vits_weights(self.configs.vits_weights_path)
             raise e
         finally:
+            run_total = time.perf_counter() - run_start
+            mem_end = proc.memory_info().rss / (1024 * 1024)
+            if "cuda" in str(self.configs.device) and torch.cuda.is_available():
+                peak_reserved = torch.cuda.max_memory_reserved(self.configs.device) / (1024 * 1024)
+                peak_allocated = torch.cuda.max_memory_allocated(self.configs.device) / (1024 * 1024)
+                gpu_fragment = (
+                    (peak_reserved - peak_allocated) / peak_reserved * 100
+                    if peak_reserved
+                    else 0.0
+                )
+            else:
+                peak_reserved = peak_allocated = gpu_fragment = 0.0
+            perf_logger.info(
+                "summary\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tencp_p=%.3f\tencp=%.3f\tcfm=%.3f\tvocoder=%.3f\tpost=%.3f\ttotal=%.3f\tmem_start=%.1fMB\tmem_end=%.1fMB\tgpu_peak_alloc=%.1fMB\tgpu_peak_reserved=%.1fMB\tgpu_frag=%.1f%%",
+                perf_stats["prepare"],
+                perf_stats["text"],
+                perf_stats["t2s"],
+                perf_stats["vits"],
+                perf_stats["vits_encp_prompt"],
+                perf_stats["vits_encp_main"],
+                perf_stats["vits_cfm"],
+                perf_stats["vits_vocoder"],
+                perf_stats["post"],
+                run_total,
+                mem_start,
+                mem_end,
+                peak_allocated,
+                peak_reserved,
+                gpu_fragment,
+            )
             self.empty_cache()
 
     def empty_cache(self):
@@ -1420,16 +1529,25 @@ class TTS:
         return sr, audio
 
     def using_vocoder_synthesis(
-        self, semantic_tokens: torch.Tensor, phones: torch.Tensor, speed: float = 1.0, sample_steps: int = 32
+        self,
+        semantic_tokens: torch.Tensor,
+        phones: torch.Tensor,
+        speed: float = 1.0,
+        sample_steps: int = 32,
+        perf_dict: dict | None = None,
     ):
+        start_all = time.perf_counter()
         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
         raw_entry = self.prompt_cache["refer_spec"][0]
         if isinstance(raw_entry, tuple):
             raw_entry = raw_entry[0]
-        refer_audio_spec = raw_entry.to(dtype=self.precision,device=self.configs.device)
+        refer_audio_spec = raw_entry.to(dtype=self.precision, device=self.configs.device)
 
+        t0 = time.perf_counter()
         fea_ref, ge = self.vits_model.decode_encp(prompt_semantic_tokens, prompt_phones, refer_audio_spec)
+        if perf_dict is not None:
+            perf_dict["vits_encp_prompt"] += time.perf_counter() - t0
         ref_audio: torch.Tensor = self.prompt_cache["raw_audio"]
         ref_sr = self.prompt_cache["raw_sr"]
         ref_audio = ref_audio.to(self.configs.device).float()
@@ -1455,10 +1573,14 @@ class TTS:
         chunk_len = T_chunk - T_min
 
         mel2 = mel2.to(self.precision)
+        t1 = time.perf_counter()
         fea_todo, ge = self.vits_model.decode_encp(semantic_tokens, phones, refer_audio_spec, ge, speed)
+        if perf_dict is not None:
+            perf_dict["vits_encp_main"] += time.perf_counter() - t1
 
         cfm_resss = []
         idx = 0
+        t2 = time.perf_counter()
         while 1:
             fea_todo_chunk = fea_todo[:, :, idx : idx + chunk_len]
             if fea_todo_chunk.shape[-1] == 0:
@@ -1475,12 +1597,19 @@ class TTS:
             fea_ref = fea_todo_chunk[:, :, -T_min:]
 
             cfm_resss.append(cfm_res)
+        if perf_dict is not None:
+            perf_dict["vits_cfm"] += time.perf_counter() - t2
         cfm_res = torch.cat(cfm_resss, 2)
         cfm_res = denorm_spec(cfm_res)
 
+        t3 = time.perf_counter()
         with torch.inference_mode():
             wav_gen = self.vocoder(cfm_res)
-            audio = wav_gen[0][0]  # .cpu().detach().numpy()
+            audio = wav_gen[0][0]
+        if perf_dict is not None:
+            perf_dict["vits_vocoder"] += time.perf_counter() - t3
+        if perf_dict is not None:
+            perf_dict["vits"] += time.perf_counter() - start_all
 
         return audio
 
@@ -1491,15 +1620,20 @@ class TTS:
         batch_phones: List[torch.Tensor],
         speed: float = 1.0,
         sample_steps: int = 32,
+        perf_dict: dict | None = None,
     ) -> List[torch.Tensor]:
+        start_all = time.perf_counter()
         prompt_semantic_tokens = self.prompt_cache["prompt_semantic"].unsqueeze(0).unsqueeze(0).to(self.configs.device)
         prompt_phones = torch.LongTensor(self.prompt_cache["phones"]).unsqueeze(0).to(self.configs.device)
         raw_entry = self.prompt_cache["refer_spec"][0]
         if isinstance(raw_entry, tuple):
             raw_entry = raw_entry[0]
-        refer_audio_spec = raw_entry.to(dtype=self.precision,device=self.configs.device)
+        refer_audio_spec = raw_entry.to(dtype=self.precision, device=self.configs.device)
 
+        t0 = time.perf_counter()
         fea_ref, ge = self.vits_model.decode_encp(prompt_semantic_tokens, prompt_phones, refer_audio_spec)
+        if perf_dict is not None:
+            perf_dict["vits_encp_prompt"] += time.perf_counter() - t0
         ref_audio: torch.Tensor = self.prompt_cache["raw_audio"]
         ref_sr = self.prompt_cache["raw_sr"]
         ref_audio = ref_audio.to(self.configs.device).float()
@@ -1525,7 +1659,7 @@ class TTS:
         chunk_len = T_chunk - T_min
 
         mel2 = mel2.to(self.precision)
-
+        
         # #### batched inference
         overlapped_len = self.vocoder_configs["overlapped_len"]
         feat_chunks = []
@@ -1536,8 +1670,11 @@ class TTS:
             phones = batch_phones[i].unsqueeze(0).to(self.configs.device)
             semantic_tokens = (
                 semantic_tokens_list[i][-idx:].unsqueeze(0).unsqueeze(0)
-            )  # .unsqueeze(0)#mq要多unsqueeze一次
+            )
+            t1 = time.perf_counter()
             feat, _ = self.vits_model.decode_encp(semantic_tokens, phones, refer_audio_spec, ge, speed)
+            if perf_dict is not None:
+                perf_dict["vits_encp_main"] += time.perf_counter() - t1
             feat_list.append(feat)
             feat_lens.append(feat.shape[2])
 
@@ -1565,9 +1702,12 @@ class TTS:
         bs = feat_chunks.shape[0]
         fea_ref = fea_ref.repeat(bs, 1, 1)
         fea = torch.cat([fea_ref, feat_chunks], 2).transpose(2, 1)
+        t2 = time.perf_counter()
         pred_spec = self.vits_model.cfm.inference(
             fea, torch.LongTensor([fea.size(1)]).to(fea.device), mel2, sample_steps, inference_cfg_rate=0
         )
+        if perf_dict is not None:
+            perf_dict["vits_cfm"] += time.perf_counter() - t2
         pred_spec = pred_spec[:, :, -chunk_len:]
         dd = pred_spec.shape[1]
         pred_spec = pred_spec.permute(1, 0, 2).contiguous().view(dd, -1).unsqueeze(0)
@@ -1575,9 +1715,12 @@ class TTS:
 
         pred_spec = denorm_spec(pred_spec)
 
+        t3 = time.perf_counter()
         with torch.no_grad():
             wav_gen = self.vocoder(pred_spec)
-            audio = wav_gen[0][0]  # .cpu().detach().numpy()
+            audio = wav_gen[0][0]
+        if perf_dict is not None:
+            perf_dict["vits_vocoder"] += time.perf_counter() - t3
 
         audio_fragments = []
         upsample_rate = self.vocoder_configs["upsample_rate"]
@@ -1597,6 +1740,8 @@ class TTS:
             audio_fragments.append(audio_fragment)
             audio = audio[feat_len * upsample_rate :]
 
+        if perf_dict is not None:
+            perf_dict["vits"] += time.perf_counter() - start_all
         return audio_fragments
 
     def sola_algorithm(
