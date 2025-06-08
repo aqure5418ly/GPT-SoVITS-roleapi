@@ -17,6 +17,7 @@ from typing import List, Tuple, Union
 
 import logging
 from time import perf_counter as _perf
+import psutil
 
 # 在模块最顶端（别放到类里）
 PERF_LOG_PATH = os.path.join(os.getcwd(), "logs", "tts_perf.log")
@@ -29,6 +30,8 @@ if not perf_logger.handlers:
     fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     fh.setFormatter(fmt)
     perf_logger.addHandler(fh)
+
+proc = psutil.Process(os.getpid())
 
 
 import ffmpeg
@@ -1042,6 +1045,16 @@ class TTS:
         sample_steps = inputs.get("sample_steps", 32)
         super_sampling = inputs.get("super_sampling", False)
 
+        run_start = time.perf_counter()
+        mem_start = proc.memory_info().rss / (1024 * 1024)
+        perf_stats = {
+            "prepare": 0.0,
+            "text": 0.0,
+            "t2s": 0.0,
+            "vits": 0.0,
+            "post": 0.0,
+        }
+
         if parallel_infer:
             print(i18n("并行推理模式已开启"))
             self.t2s_model.model.infer_panel = self.t2s_model.model.infer_panel_batch_infer
@@ -1125,6 +1138,7 @@ class TTS:
 
         ###### text preprocessing ########
         t1 = time.perf_counter()
+        perf_stats["prepare"] += t1 - t0
         data: list = None
         if not return_fragment:
             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
@@ -1180,6 +1194,7 @@ class TTS:
                 return batch[0]
 
         t2 = time.perf_counter()
+        perf_stats["text"] += t2 - t1
         try:
             print("############ 推理 ############")
             ###### inference ######
@@ -1227,6 +1242,7 @@ class TTS:
                 )
                 t4 = time.perf_counter()
                 t_34 += t4 - t3
+                perf_stats["t2s"] += t4 - t3
 
                 refer_audio_spec = []
                 if self.is_v2pro:sv_emb=[]
@@ -1307,9 +1323,11 @@ class TTS:
 
                 t5 = time.perf_counter()
                 t_45 += t5 - t4
+                perf_stats["vits"] += t5 - t4
                 if return_fragment:
                     print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t4 - t3, t5 - t4))
-                    yield self.audio_postprocess(
+                    pp_start = time.perf_counter()
+                    out = self.audio_postprocess(
                         [batch_audio_fragment],
                         output_sr,
                         None,
@@ -1318,6 +1336,16 @@ class TTS:
                         fragment_interval,
                         super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                     )
+                    perf_stats["post"] += time.perf_counter() - pp_start
+                    perf_logger.info(
+                        "fragment\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tpost=%.3f",
+                        perf_stats["prepare"],
+                        perf_stats["text"],
+                        perf_stats["t2s"],
+                        perf_stats["vits"],
+                        perf_stats["post"],
+                    )
+                    yield out
                 else:
                     audio.append(batch_audio_fragment)
 
@@ -1330,7 +1358,8 @@ class TTS:
                 if len(audio) == 0:
                     yield 16000, np.zeros(int(16000), dtype=np.int16)
                     return
-                yield self.audio_postprocess(
+                pp_start = time.perf_counter()
+                out = self.audio_postprocess(
                     audio,
                     output_sr,
                     batch_index_list,
@@ -1339,6 +1368,16 @@ class TTS:
                     fragment_interval,
                     super_sampling if self.configs.use_vocoder and self.configs.version == "v3" else False,
                 )
+                perf_stats["post"] += time.perf_counter() - pp_start
+                perf_logger.info(
+                    "run\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tpost=%.3f",
+                    perf_stats["prepare"],
+                    perf_stats["text"],
+                    perf_stats["t2s"],
+                    perf_stats["vits"],
+                    perf_stats["post"],
+                )
+                yield out
 
         except Exception as e:
             traceback.print_exc()
@@ -1353,6 +1392,19 @@ class TTS:
             self.init_vits_weights(self.configs.vits_weights_path)
             raise e
         finally:
+            run_total = time.perf_counter() - run_start
+            mem_end = proc.memory_info().rss / (1024 * 1024)
+            perf_logger.info(
+                "summary\tprep=%.3f\ttext=%.3f\tt2s=%.3f\tvits=%.3f\tpost=%.3f\ttotal=%.3f\tmem_start=%.1fMB\tmem_end=%.1fMB",
+                perf_stats["prepare"],
+                perf_stats["text"],
+                perf_stats["t2s"],
+                perf_stats["vits"],
+                perf_stats["post"],
+                run_total,
+                mem_start,
+                mem_end,
+            )
             self.empty_cache()
 
     def empty_cache(self):
