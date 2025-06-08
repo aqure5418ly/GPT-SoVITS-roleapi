@@ -3,13 +3,16 @@ import math
 import os, sys, gc
 import random
 import traceback
+import logging
+import psutil
+import json
+from datetime import datetime
 
 import torchaudio
 from tqdm import tqdm
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 import ffmpeg
-import os
 from typing import Generator, List, Tuple, Union
 import numpy as np
 import torch
@@ -34,6 +37,18 @@ from process_ckpt import get_sovits_version_from_path_fast, load_sovits_new
 language=os.environ.get("language","Auto")
 language=sys.argv[-1] if sys.argv[-1] in scan_language_list() else language
 i18n = I18nAuto(language=language)
+
+# setup logger
+log_dir = os.path.join(now_dir, "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "tts_run.log")
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.setLevel(logging.INFO)
 
 
 
@@ -895,6 +910,15 @@ class TTS:
         sample_steps = inputs.get("sample_steps", 32)
         super_sampling = inputs.get("super_sampling", False)
 
+        # performance metrics
+        start_time = ttime()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.configs.device)
+        process = psutil.Process(os.getpid())
+        perf_data = {
+            "start": datetime.now().isoformat()
+        }
+
         if parallel_infer:
             print(i18n("并行推理模式已开启"))
             self.t2s_model.model.infer_panel = self.t2s_model.model.infer_panel_batch_infer
@@ -976,6 +1000,7 @@ class TTS:
 
         ###### text preprocessing ########
         t1 = ttime()
+        perf_data["ref_proc_time"] = t1 - start_time
         data:list = None
         if not return_fragment:
             data = self.text_preprocessor.preprocess(text, text_lang, text_split_method, self.configs.version)
@@ -1028,6 +1053,7 @@ class TTS:
 
 
         t2 = ttime()
+        perf_data["text_proc_time"] = t2 - t1
         try:
             print("############ 推理 ############")
             ###### inference ######
@@ -1132,7 +1158,12 @@ class TTS:
                 t_45 += t5 - t4
                 if return_fragment:
                     print("%.3f\t%.3f\t%.3f\t%.3f" % (t1 - t0, t2 - t1, t4 - t3, t5 - t4))
-                    yield self.audio_postprocess([batch_audio_fragment],
+                    perf_data.update({
+                        "semantic_time": t4 - t3,
+                        "vits_time": t5 - t4,
+                    })
+                    post_t = ttime()
+                    result = self.audio_postprocess([batch_audio_fragment],
                                                     output_sr,
                                                     None,
                                                     speed_factor,
@@ -1140,6 +1171,13 @@ class TTS:
                                                     fragment_interval,
                                                     super_sampling if self.configs.is_v3_synthesizer else False
                                                     )
+                    perf_data["post_time"] = ttime() - post_t
+                    perf_data["total_time"] = ttime() - start_time
+                    perf_data["cpu_mem_mb"] = process.memory_info().rss / (1024 ** 2)
+                    if torch.cuda.is_available():
+                        perf_data["gpu_mem_mb"] = torch.cuda.max_memory_allocated(self.configs.device) / (1024 ** 2)
+                    logger.info("fragment_performance: %s", json.dumps(perf_data))
+                    yield result
                 else:
                     audio.append(batch_audio_fragment)
 
@@ -1152,7 +1190,12 @@ class TTS:
                 if len(audio) == 0:
                     yield 16000, np.zeros(int(16000), dtype=np.int16)
                     return
-                yield self.audio_postprocess(audio,
+                perf_data.update({
+                    "semantic_time": t_34,
+                    "vits_time": t_45,
+                })
+                post_t = ttime()
+                result = self.audio_postprocess(audio,
                                                 output_sr,
                                                 batch_index_list,
                                                 speed_factor,
@@ -1160,6 +1203,13 @@ class TTS:
                                                 fragment_interval,
                                                 super_sampling if self.configs.is_v3_synthesizer else False
                                                 )
+                perf_data["post_time"] = ttime() - post_t
+                perf_data["total_time"] = ttime() - start_time
+                perf_data["cpu_mem_mb"] = process.memory_info().rss / (1024 ** 2)
+                if torch.cuda.is_available():
+                    perf_data["gpu_mem_mb"] = torch.cuda.max_memory_allocated(self.configs.device) / (1024 ** 2)
+                logger.info("run_performance: %s", json.dumps(perf_data))
+                yield result
 
         except Exception as e:
             traceback.print_exc()
@@ -1172,6 +1222,11 @@ class TTS:
             self.vits_model = None
             self.init_t2s_weights(self.configs.t2s_weights_path)
             self.init_vits_weights(self.configs.vits_weights_path)
+            perf_data["total_time"] = ttime() - start_time
+            perf_data["cpu_mem_mb"] = process.memory_info().rss / (1024 ** 2)
+            if torch.cuda.is_available():
+                perf_data["gpu_mem_mb"] = torch.cuda.max_memory_allocated(self.configs.device) / (1024 ** 2)
+            logger.error("run_error: %s", json.dumps(perf_data))
             raise e
         finally:
             self.empty_cache()
